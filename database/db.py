@@ -1,0 +1,661 @@
+import asyncio
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import aiosqlite
+
+from config import DATABASE_PATH, SOLD_EXPORT_DIR
+
+
+class Database:
+    def __init__(self, path: Path = DATABASE_PATH):
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    async def connect(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        SOLD_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(self.path) as db:
+            await self._init_schema(db)
+            await self._seed_defaults(db)
+            for admin_id in __import__("config").ADMIN_IDS:
+                await db.execute(
+                    "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (admin_id,)
+                )
+            await db.commit()
+
+    async def _init_schema(self, db: aiosqlite.Connection) -> None:
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                price REAL NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER NOT NULL,
+                login TEXT NOT NULL,
+                password TEXT NOT NULL,
+                backup_email TEXT DEFAULT '',
+                backup_password TEXT DEFAULT '',
+                twofa_key TEXT DEFAULT '',
+                channel_link TEXT DEFAULT '',
+                status TEXT DEFAULT 'available',
+                order_id INTEGER,
+                reserved_until TEXT,
+                sold_at TEXT,
+                FOREIGN KEY (category_id) REFERENCES categories(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_products_category_status
+                ON products(category_id, status);
+
+            CREATE TABLE IF NOT EXISTS cart (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                category_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(user_id, category_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                total REAL NOT NULL,
+                payment_method TEXT NOT NULL,
+                crypto_asset TEXT,
+                status TEXT DEFAULT 'pending',
+                external_payment_id TEXT,
+                payment_url TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                paid_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                category_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                price REAL NOT NULL,
+                FOREIGN KEY (order_id) REFERENCES orders(id)
+            );
+            """
+        )
+
+    async def _seed_defaults(self, db: aiosqlite.Connection) -> None:
+        defaults = {
+            "welcome_text": __import__("config").WELCOME_TEXT,
+            "reviews_url": __import__("config").REVIEWS_URL,
+            "support_username": __import__("config").SUPPORT_USERNAME,
+            "guarantees_text": (
+                "🛡 <b>Гарантии</b>\n\n"
+                "• Замена в течение 24 часов при проблемах с доступом\n"
+                "• Проверка канала перед выдачей\n"
+                "• Поддержка после покупки"
+            ),
+            "agreement_text": (
+                "📜 <b>Пользовательское соглашение</b>\n\n"
+                "1. Товар выдаётся в электронном виде после оплаты\n"
+                "2. Возврат средств не предусмотрен после выдачи данных\n"
+                "3. Покупатель обязан сменить все пароли после получения\n"
+                "4. Администрация не несёт ответственности за действия покупателя с аккаунтом"
+            ),
+            "crypto_usdt_trc20": "",
+            "crypto_usdt_bep20": "",
+            "crypto_usdt_erc20": "",
+            "crypto_usdt_aptos": "",
+            "crypto_usdt_ton": "",
+            "crypto_usdt_solana": "",
+        }
+        for key, value in defaults.items():
+            await db.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
+    # --- Settings ---
+
+    async def get_setting(self, key: str, default: str = "") -> str:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else default
+
+    async def set_setting(self, key: str, value: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            await db.commit()
+
+    # --- Admins ---
+
+    async def is_admin(self, user_id: int) -> bool:
+        if user_id in __import__("config").ADMIN_IDS:
+            return True
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT 1 FROM admins WHERE user_id = ?", (user_id,)
+            ) as cur:
+                return await cur.fetchone() is not None
+
+    async def add_admin(self, user_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,)
+            )
+            await db.commit()
+
+    # --- Categories ---
+
+    async def get_categories(self, active_only: bool = True) -> list[dict]:
+        query = "SELECT * FROM categories"
+        if active_only:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY sort_order, id"
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    async def get_category(self, category_id: int) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM categories WHERE id = ?", (category_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def create_category(
+        self, name: str, description: str, price: float
+    ) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "INSERT INTO categories (name, description, price) VALUES (?, ?, ?)",
+                (name, description, price),
+            )
+            await db.commit()
+            return cur.lastrowid
+
+    async def update_category(
+        self, category_id: int, **fields: Any
+    ) -> None:
+        allowed = {"name", "description", "price", "is_active", "sort_order"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [category_id]
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                f"UPDATE categories SET {sets} WHERE id = ?", values
+            )
+            await db.commit()
+
+    async def delete_category(self, category_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM products WHERE category_id = ?", (category_id,))
+            await db.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+            await db.commit()
+
+    async def count_available(self, category_id: int) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM products WHERE category_id = ? AND status = 'available'",
+                (category_id,),
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
+
+    # --- Products ---
+
+    @staticmethod
+    def parse_product_line(line: str) -> dict | None:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+        parts = line.split(":")
+        if len(parts) < 6:
+            return None
+        return {
+            "login": parts[0],
+            "password": parts[1],
+            "backup_email": parts[2],
+            "backup_password": parts[3],
+            "twofa_key": parts[4],
+            "channel_link": ":".join(parts[5:]),
+        }
+
+    async def bulk_add_products(self, category_id: int, lines: list[str]) -> int:
+        added = 0
+        async with aiosqlite.connect(self.path) as db:
+            for line in lines:
+                parsed = self.parse_product_line(line)
+                if not parsed:
+                    continue
+                await db.execute(
+                    """INSERT INTO products
+                    (category_id, login, password, backup_email, backup_password,
+                     twofa_key, channel_link, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'available')""",
+                    (
+                        category_id,
+                        parsed["login"],
+                        parsed["password"],
+                        parsed["backup_email"],
+                        parsed["backup_password"],
+                        parsed["twofa_key"],
+                        parsed["channel_link"],
+                    ),
+                )
+                added += 1
+            await db.commit()
+        return added
+
+    async def get_product(self, product_id: int) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM products WHERE id = ?", (product_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def mark_product_sold_manual(self, product_id: int) -> bool:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT * FROM products WHERE id = ? AND status = 'available'",
+                    (product_id,),
+                ) as cur:
+                    product = await cur.fetchone()
+                    if not product:
+                        return False
+                sold_at = datetime.utcnow().isoformat()
+                await db.execute(
+                    "UPDATE products SET status = 'sold', sold_at = ?, order_id = NULL "
+                    "WHERE id = ? AND status = 'available'",
+                    (sold_at, product_id),
+                )
+                await db.commit()
+                if db.total_changes == 0:
+                    return False
+        await self._export_sold_product(dict(product), order_id=None)
+        return True
+
+    async def list_products(
+        self, category_id: int, status: str = "available", limit: int = 20
+    ) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, login, status FROM products WHERE category_id = ? AND status = ? "
+                "ORDER BY id LIMIT ?",
+                (category_id, status, limit),
+            ) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    # --- Cart ---
+
+    async def get_cart(self, user_id: int) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT c.*, cat.name, cat.price, cat.description
+                FROM cart c
+                JOIN categories cat ON cat.id = c.category_id
+                WHERE c.user_id = ?""",
+                (user_id,),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def add_to_cart(
+        self, user_id: int, category_id: int, quantity: int
+    ) -> tuple[bool, str]:
+        available = await self.count_available(category_id)
+        if available < quantity:
+            return False, f"Доступно только {available} шт."
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT quantity FROM cart WHERE user_id = ? AND category_id = ?",
+                (user_id, category_id),
+            ) as cur:
+                existing = await cur.fetchone()
+            new_qty = (existing[0] if existing else 0) + quantity
+            if new_qty > available:
+                return False, f"В корзине уже есть товары. Максимум: {available} шт."
+            if existing:
+                await db.execute(
+                    "UPDATE cart SET quantity = ? WHERE user_id = ? AND category_id = ?",
+                    (new_qty, user_id, category_id),
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO cart (user_id, category_id, quantity) VALUES (?, ?, ?)",
+                    (user_id, category_id, quantity),
+                )
+            await db.commit()
+        return True, "Добавлено в корзину"
+
+    async def update_cart_item(
+        self, user_id: int, category_id: int, quantity: int
+    ) -> tuple[bool, str]:
+        if quantity <= 0:
+            await self.remove_from_cart(user_id, category_id)
+            return True, "Удалено из корзины"
+        available = await self.count_available(category_id)
+        if quantity > available:
+            return False, f"Доступно только {available} шт."
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE cart SET quantity = ? WHERE user_id = ? AND category_id = ?",
+                (quantity, user_id, category_id),
+            )
+            await db.commit()
+        return True, "Корзина обновлена"
+
+    async def remove_from_cart(self, user_id: int, category_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "DELETE FROM cart WHERE user_id = ? AND category_id = ?",
+                (user_id, category_id),
+            )
+            await db.commit()
+
+    async def clear_cart(self, user_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM cart WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+    async def cart_total(self, user_id: int) -> float:
+        items = await self.get_cart(user_id)
+        return sum(item["quantity"] * item["price"] for item in items)
+
+    # --- Orders & fulfillment ---
+
+    async def create_order(
+        self,
+        user_id: int,
+        items: list[dict],
+        total: float,
+        payment_method: str,
+        crypto_asset: str | None = None,
+        external_payment_id: str | None = None,
+        payment_url: str | None = None,
+    ) -> int | None:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    for item in items:
+                        async with db.execute(
+                            "SELECT COUNT(*) FROM products "
+                            "WHERE category_id = ? AND status = 'available'",
+                            (item["category_id"],),
+                        ) as cur:
+                            count = (await cur.fetchone())[0]
+                        if count < item["quantity"]:
+                            await db.execute("ROLLBACK")
+                            return None
+
+                    cur = await db.execute(
+                        """INSERT INTO orders
+                        (user_id, total, payment_method, crypto_asset,
+                         external_payment_id, payment_url, status)
+                        VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+                        (
+                            user_id,
+                            total,
+                            payment_method,
+                            crypto_asset,
+                            external_payment_id,
+                            payment_url,
+                        ),
+                    )
+                    order_id = cur.lastrowid
+
+                    reserve_until = (
+                        datetime.utcnow() + timedelta(minutes=__import__("config").RESERVE_MINUTES)
+                    ).isoformat()
+
+                    for item in items:
+                        await db.execute(
+                            "INSERT INTO order_items (order_id, category_id, quantity, price) "
+                            "VALUES (?, ?, ?, ?)",
+                            (order_id, item["category_id"], item["quantity"], item["price"]),
+                        )
+                        await db.execute(
+                            """UPDATE products SET status = 'reserved', order_id = ?,
+                            reserved_until = ?
+                            WHERE id IN (
+                                SELECT id FROM products
+                                WHERE category_id = ? AND status = 'available'
+                                ORDER BY id LIMIT ?
+                            )""",
+                            (order_id, reserve_until, item["category_id"], item["quantity"]),
+                        )
+
+                    await db.execute("COMMIT")
+                    return order_id
+                except Exception:
+                    await db.execute("ROLLBACK")
+                    raise
+
+    async def get_order(self, order_id: int) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM orders WHERE id = ?", (order_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def get_order_items(self, order_id: int) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT oi.*, c.name as category_name
+                FROM order_items oi
+                JOIN categories c ON c.id = oi.category_id
+                WHERE oi.order_id = ?""",
+                (order_id,),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def update_order_payment(
+        self, order_id: int, external_payment_id: str, payment_url: str
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE orders SET external_payment_id = ?, payment_url = ? WHERE id = ?",
+                (external_payment_id, payment_url, order_id),
+            )
+            await db.commit()
+
+    async def get_pending_orders(self) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM orders WHERE status IN ('pending', 'awaiting_confirmation')"
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def set_order_awaiting_confirmation(self, order_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "UPDATE orders SET status = 'awaiting_confirmation' "
+                "WHERE id = ? AND status = 'pending'",
+                (order_id,),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def cancel_order(self, order_id: int) -> bool:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                async with db.execute(
+                    "SELECT status FROM orders WHERE id = ?", (order_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                if not row or row[0] in ("paid", "cancelled"):
+                    return False
+                await db.execute(
+                    "UPDATE products SET status = 'available', order_id = NULL, "
+                    "reserved_until = NULL WHERE order_id = ? AND status = 'reserved'",
+                    (order_id,),
+                )
+                await db.execute(
+                    "UPDATE orders SET status = 'cancelled' WHERE id = ?", (order_id,)
+                )
+                await db.commit()
+        return True
+
+    async def format_order_summary(self, order_id: int) -> str:
+        order = await self.get_order(order_id)
+        if not order:
+            return ""
+        items = await self.get_order_items(order_id)
+        total_qty = sum(i["quantity"] for i in items)
+        lines = [
+            f"• {i['category_name']} — {i['quantity']} шт. × {i['price']:.0f} ₽"
+            for i in items
+        ]
+        method = order["payment_method"]
+        if method == "crypto" and order.get("crypto_asset"):
+            from constants import CRYPTO_LABELS
+
+            method = f"Крипто ({CRYPTO_LABELS.get(order['crypto_asset'], order['crypto_asset'])})"
+        elif method == "yookassa":
+            method = "ЮKassa"
+        return (
+            f"🧾 <b>Заказ #{order_id}</b>\n"
+            f"👤 Покупатель: <code>{order['user_id']}</code>\n"
+            f"💰 Сумма: <b>{order['total']:.0f} ₽</b>\n"
+            f"📦 Аккаунтов: <b>{total_qty}</b> шт.\n"
+            f"💳 Способ: {method}\n\n"
+            f"<b>Категории:</b>\n" + "\n".join(lines)
+        )
+
+    async def cancel_expired_orders(self) -> list[int]:
+        now = datetime.utcnow().isoformat()
+        cancelled = []
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    """SELECT id FROM orders o
+                    WHERE o.status = 'pending'
+                    AND EXISTS (
+                        SELECT 1 FROM products p
+                        WHERE p.order_id = o.id AND p.reserved_until < ?
+                    )""",
+                    (now,),
+                ) as cur:
+                    order_ids = [r[0] for r in await cur.fetchall()]
+
+                for oid in order_ids:
+                    await db.execute(
+                        "UPDATE products SET status = 'available', order_id = NULL, "
+                        "reserved_until = NULL WHERE order_id = ? AND status = 'reserved'",
+                        (oid,),
+                    )
+                    await db.execute(
+                        "UPDATE orders SET status = 'cancelled' WHERE id = ?", (oid,)
+                    )
+                    cancelled.append(oid)
+                await db.commit()
+        return cancelled
+
+    async def fulfill_order(self, order_id: int) -> list[dict] | None:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    async with db.execute(
+                        "SELECT status FROM orders WHERE id = ?", (order_id,)
+                    ) as cur:
+                        order_row = await cur.fetchone()
+                    if not order_row or order_row["status"] == "paid":
+                        await db.execute("ROLLBACK")
+                        return None
+
+                    async with db.execute(
+                        "SELECT * FROM products WHERE order_id = ? AND status = 'reserved'",
+                        (order_id,),
+                    ) as cur:
+                        products = [dict(r) for r in await cur.fetchall()]
+
+                    if not products:
+                        await db.execute("ROLLBACK")
+                        return None
+
+                    sold_at = datetime.utcnow().isoformat()
+                    for p in products:
+                        updated = await db.execute(
+                            "UPDATE products SET status = 'sold', sold_at = ? "
+                            "WHERE id = ? AND status = 'reserved'",
+                            (sold_at, p["id"]),
+                        )
+                        if updated.rowcount == 0:
+                            await db.execute("ROLLBACK")
+                            return None
+
+                    await db.execute(
+                        "UPDATE orders SET status = 'paid', paid_at = ? WHERE id = ? AND status != 'paid'",
+                        (sold_at, order_id),
+                    )
+                    await db.execute("COMMIT")
+                except Exception:
+                    await db.execute("ROLLBACK")
+                    raise
+
+        for product in products:
+            await self._export_sold_product(product, order_id)
+        return products
+
+    async def _export_sold_product(self, product: dict, order_id: int | None) -> None:
+        line = (
+            f"{product['login']}:{product['password']}:{product['backup_email']}:"
+            f"{product['backup_password']}:{product['twofa_key']}:{product['channel_link']}"
+        )
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        filepath = SOLD_EXPORT_DIR / f"sold_{date_str}.txt"
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(f"[order:{order_id}] {line}\n")
+
+    @staticmethod
+    def format_product_delivery(product: dict, index: int) -> str:
+        return (
+            f"<b>Канал #{index}</b>\n"
+            f"👤 Логин: <code>{product['login']}</code>\n"
+            f"🔑 Пароль: <code>{product['password']}</code>\n"
+            f"📧 Резервная почта: <code>{product['backup_email']}</code>\n"
+            f"🔐 Пароль почты: <code>{product['backup_password']}</code>\n"
+            f"🔒 Ключ 2FA: <code>{product['twofa_key']}</code>\n"
+            f"🔗 Ссылка: {product['channel_link']}\n"
+        )
