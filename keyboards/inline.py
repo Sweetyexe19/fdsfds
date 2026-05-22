@@ -207,16 +207,16 @@ def admin_categories_kb(
     back_callback: str = "adm:categories",
     leaves: dict[int, bool] | None = None,
     counts: dict[int, int] | None = None,
+    add_child_label: str = "➕ Подкатегория",
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if container_id is None:
-        builder.row(
-            InlineKeyboardButton(text="➕ Категория", callback_data="adm:cat_new"),
-        )
+        btn = "➕ Ещё категория" if categories else "➕ Категория"
+        builder.row(InlineKeyboardButton(text=btn, callback_data="adm:cat_new"))
     else:
         builder.row(
             InlineKeyboardButton(
-                text="➕ Подкатегория",
+                text=add_child_label,
                 callback_data=f"adm:cat_new:{container_id}",
             ),
         )
@@ -250,6 +250,7 @@ def admin_category_kb(
     is_leaf: bool,
     can_add_child: bool,
     parent_id: int | None,
+    add_child_label: str = "➕ Подкатегория",
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -282,7 +283,7 @@ def admin_category_kb(
     if can_add_child:
         builder.row(
             InlineKeyboardButton(
-                text="➕ Подкатегория",
+                text=add_child_label,
                 callback_data=f"adm:cat_new:{category_id}",
             ),
         )
@@ -358,4 +359,30 @@ def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
 def back_main_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="main"))
+    return builder.as_markup()
+
+
+def admin_after_create_kb(parent_id: int | None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if parent_id is not None:
+        builder.row(
+            InlineKeyboardButton(
+                text="➕ Ещё подкатегория",
+                callback_data=f"adm:cat_new:{parent_id}",
+            ),
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="📂 К списку разделов",
+                callback_data=f"adm:children:{parent_id}",
+            ),
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(text="➕ Ещё категория", callback_data="adm:cat_new"),
+        )
+        builder.row(
+            InlineKeyboardButton(text="📂 К категориям", callback_data="adm:categories"),
+        )
+    builder.row(InlineKeyboardButton(text="◀️ Админ", callback_data="adm:main"))
     return builder.as_markup()

@@ -243,15 +243,22 @@ class Database:
             depth += 1
             current_id = cat["parent_id"]
 
+    async def count_direct_products(self, category_id: int) -> int:
+        """Товары, привязанные именно к этому узлу (не к подразделам)."""
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM products WHERE category_id = ?",
+                (category_id,),
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
+
     async def can_add_child(self, category_id: int) -> bool:
+        """Можно добавить ещё одну подкатегорию/подподкатегорию."""
         if await self.get_category_depth(category_id) >= MAX_CATEGORY_DEPTH:
             return False
-        if await self.has_children(category_id):
+        if await self.count_direct_products(category_id) > 0:
             return False
-        if await self.is_leaf(category_id):
-            direct = await self.count_available(category_id)
-            if direct > 0:
-                return False
         return True
 
     async def get_category_path(self, category_id: int) -> str:

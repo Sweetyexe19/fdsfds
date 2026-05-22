@@ -17,12 +17,12 @@ from keyboards.inline import (
     admin_settings_kb,
     back_main_kb,
 )
-from services.catalog_nav import level_name
+from services.catalog_nav import add_child_button_label, level_name
 from services.delivery import deliver_order
 from services.encryption import DataEncryptor
 from services.sold_archive import archive_exists, clear_archive, get_archive_path
 from states import AdminCategory, AdminManualSell, AdminProducts, AdminSeed, AdminSettings
-from keyboards.inline import admin_upload_pick_kb
+from keyboards.inline import admin_after_create_kb, admin_upload_pick_kb
 from utils.callbacks import parse_callback_id, parse_callback_id_field
 
 router = Router()
@@ -64,6 +64,13 @@ async def _admin_list_categories(
     ids = [c["id"] for c in categories]
     leaves = {cid: await db.is_leaf(cid) for cid in ids}
     counts = await db.count_available_map(ids)
+    if container_id is None:
+        add_label = "➕ Ещё категория" if categories else "➕ Категория"
+    else:
+        parent_depth = await db.get_category_depth(container_id)
+        add_label = add_child_button_label(
+            parent_depth, more=bool(categories)
+        )
     await callback.message.edit_text(
         title,
         reply_markup=admin_categories_kb(
@@ -72,6 +79,7 @@ async def _admin_list_categories(
             back_callback=back_callback,
             leaves=leaves,
             counts=counts,
+            add_child_label=add_label,
         ),
     )
 
@@ -120,7 +128,13 @@ async def cb_cat_new_child(callback: CallbackQuery, state: FSMContext, db: Datab
         return
     parent_id = parse_callback_id(callback.data, "adm:cat_new")
     if not await db.can_add_child(parent_id):
-        await callback.answer("Нельзя добавить подраздел", show_alert=True)
+        if await db.count_direct_products(parent_id) > 0:
+            await callback.answer(
+                "Сначала удалите товары с этого уровня или создайте подраздел в пустой категории",
+                show_alert=True,
+            )
+        else:
+            await callback.answer("Достигнут максимальный уровень вложенности", show_alert=True)
         return
     parent = await db.get_category(parent_id)
     depth = await db.get_category_depth(parent_id) + 1
@@ -146,12 +160,16 @@ async def admin_cat_description(message: Message, state: FSMContext, db: Databas
     parent_id = data.get("parent_id")
     if parent_id and not await db.can_add_child(parent_id):
         await state.clear()
-        await message.answer("❌ Достигнут максимальный уровень вложенности")
+        await message.answer(
+            "❌ Нельзя добавить подраздел (лимит уровней или на этом уровне уже есть товары)"
+        )
         return
     await state.set_state(AdminCategory.price)
     await message.answer(
-        "Введите цену за канал в рублях:\n"
-        "(0 — если планируете добавить подкатегории без товаров здесь)"
+        "Введите цену за канал в рублях.\n\n"
+        "• У каждого подраздела может быть <b>своя цена</b>\n"
+        "• 0 — если это папка и товары будут в подразделах\n"
+        "• После создания можно добавить ещё подразделы"
     )
 
 
@@ -177,9 +195,10 @@ async def admin_cat_price(message: Message, state: FSMContext, db: Database) -> 
         else "Загрузите товары: /admin → Загрузить TXT"
     )
     await message.answer(
-        f"✅ Создано: <b>{path}</b> (ID: {cat_id})\n\n{hint}\n\n"
-        f"Формат: <code>логин:пароль:резервка:пароль:ключ2фа:ссылка</code>",
-        reply_markup=admin_main_kb(),
+        f"✅ Создано: <b>{path}</b> (ID: {cat_id})\n"
+        f"💰 Цена: <b>{price:.0f} ₽</b>\n\n{hint}\n\n"
+        f"Формат TXT: <code>логин:пароль:резервка:пароль:ключ2фа:ссылка</code>",
+        reply_markup=admin_after_create_kb(parent_id),
     )
 
 
@@ -207,11 +226,25 @@ async def cb_admin_cat_detail(callback: CallbackQuery, db: Database) -> None:
             f"💰 {price:.0f} ₽ | 📊 {count} шт."
         )
     else:
+        children = await db.get_children(category_id, active_only=False)
+        child_lines = []
+        for ch in children:
+            ch_leaf = await db.is_leaf(ch["id"])
+            ch_count = await db.count_available(ch["id"])
+            ch_price = ch.get("price") or 0
+            if ch_leaf and ch_price > 0:
+                child_lines.append(f"• {ch['name']} — {ch_price:.0f}₽ ({ch_count} шт.)")
+            elif ch_leaf:
+                child_lines.append(f"• {ch['name']} ({ch_count} шт.)")
+            else:
+                child_lines.append(f"• {ch['name']} →")
+        subs = "\n".join(child_lines) if child_lines else "—"
         text = (
             f"📁 <b>{path}</b> (ID: {cat['id']})\n"
-            f"Уровень: {level_name(depth)} (есть подразделы)\n\n"
+            f"Уровень: {level_name(depth)} — контейнер\n\n"
             f"{cat['description']}\n\n"
-            f"📊 Всего в разделе: {count} шт."
+            f"<b>Подразделы:</b>\n{subs}\n\n"
+            f"📊 Всего товаров: {count} шт."
         )
     await callback.message.edit_text(
         text,
@@ -221,6 +254,7 @@ async def cb_admin_cat_detail(callback: CallbackQuery, db: Database) -> None:
             is_leaf=is_leaf,
             can_add_child=can_child,
             parent_id=cat.get("parent_id"),
+            add_child_label=add_child_button_label(depth, more=not is_leaf),
         ),
     )
     await callback.answer()
