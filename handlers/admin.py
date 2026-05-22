@@ -1,3 +1,5 @@
+import re
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -21,8 +23,12 @@ from services.encryption import DataEncryptor
 from services.sold_archive import archive_exists, clear_archive, get_archive_path
 from states import AdminCategory, AdminManualSell, AdminProducts, AdminSeed, AdminSettings
 from keyboards.inline import admin_upload_pick_kb
+from utils.callbacks import parse_callback_id, parse_callback_id_field
 
 router = Router()
+
+_RE_ADM_CAT = re.compile(r"^adm:cat:\d+$")
+_RE_ADM_UPLOAD = re.compile(r"^adm:upload:\d+$")
 
 
 async def admin_filter(callback_or_message, db: Database) -> bool:
@@ -84,7 +90,7 @@ async def cb_admin_categories(callback: CallbackQuery, db: Database) -> None:
 async def cb_admin_children(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    container_id = int(callback.data.split(":")[2])
+    container_id = parse_callback_id(callback.data, "adm:children")
     cat = await db.get_category(container_id)
     if not cat:
         await callback.answer("Не найдено", show_alert=True)
@@ -112,7 +118,7 @@ async def cb_cat_new_root(callback: CallbackQuery, state: FSMContext, db: Databa
 async def cb_cat_new_child(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    parent_id = int(callback.data.split(":")[3])
+    parent_id = parse_callback_id(callback.data, "adm:cat_new")
     if not await db.can_add_child(parent_id):
         await callback.answer("Нельзя добавить подраздел", show_alert=True)
         return
@@ -177,11 +183,11 @@ async def admin_cat_price(message: Message, state: FSMContext, db: Database) -> 
     )
 
 
-@router.callback_query(F.data.startswith("adm:cat:"))
+@router.callback_query(F.data.regexp(_RE_ADM_CAT))
 async def cb_admin_cat_detail(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    category_id = int(callback.data.split(":")[2])
+    category_id = parse_callback_id(callback.data, "adm:cat")
     cat = await db.get_category(category_id)
     if not cat:
         await callback.answer("Не найдено", show_alert=True)
@@ -224,7 +230,7 @@ async def cb_admin_cat_detail(callback: CallbackQuery, db: Database) -> None:
 async def cb_toggle_category(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    category_id = int(callback.data.split(":")[2])
+    category_id = parse_callback_id(callback.data, "adm:toggle")
     cat = await db.get_category(category_id)
     await db.update_category(category_id, is_active=0 if cat["is_active"] else 1)
     await cb_admin_cat_detail(callback, db)
@@ -234,7 +240,7 @@ async def cb_toggle_category(callback: CallbackQuery, db: Database) -> None:
 async def cb_delete_category(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    category_id = int(callback.data.split(":")[2])
+    category_id = parse_callback_id(callback.data, "adm:del")
     await db.delete_category(category_id)
     await callback.answer("Категория удалена")
     await cb_admin_categories(callback, db)
@@ -244,8 +250,7 @@ async def cb_delete_category(callback: CallbackQuery, db: Database) -> None:
 async def cb_edit_category(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    parts = callback.data.split(":")
-    category_id, field = int(parts[2]), parts[3]
+    category_id, field = parse_callback_id_field(callback.data, "adm:edit")
     await state.set_state(AdminCategory.edit_value)
     await state.update_data(category_id=category_id, field=field)
     labels = {"name": "название", "description": "описание", "price": "цену"}
@@ -308,7 +313,7 @@ async def cb_upload_menu(callback: CallbackQuery, db: Database) -> None:
 async def cb_upload_nav(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    container_id = int(callback.data.split(":")[2])
+    container_id = parse_callback_id(callback.data, "adm:upload_nav")
     await _admin_upload_picker(callback, db, container_id, f"adm:upload_back:{container_id}")
     await callback.answer()
 
@@ -317,18 +322,18 @@ async def cb_upload_nav(callback: CallbackQuery, db: Database) -> None:
 async def cb_upload_back(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    ref_id = int(callback.data.split(":")[2])
+    ref_id = parse_callback_id(callback.data, "adm:upload_back")
     cat = await db.get_category(ref_id)
     list_parent = cat.get("parent_id") if cat else None
     await _admin_upload_picker(callback, db, list_parent, "adm:main")
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("adm:upload:"))
+@router.callback_query(F.data.regexp(_RE_ADM_UPLOAD))
 async def cb_upload_category(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    category_id = int(callback.data.split(":")[2])
+    category_id = parse_callback_id(callback.data, "adm:upload")
     if not await db.is_leaf(category_id):
         await callback.answer(
             "Загрузка только в конечный раздел без подкатегорий",
@@ -373,7 +378,7 @@ async def admin_upload_file(message: Message, state: FSMContext, db: Database) -
 async def cb_list_products(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    category_id = int(callback.data.split(":")[2])
+    category_id = parse_callback_id(callback.data, "adm:products")
     products = await db.list_products(category_id, limit=15)
     if not products:
         await callback.answer("Нет товаров", show_alert=True)
@@ -569,7 +574,7 @@ async def admin_set_seed(
 async def cb_confirm_order(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    order_id = int(callback.data.split(":")[2])
+    order_id = parse_callback_id(callback.data, "adm:confirm")
     order = await db.get_order(order_id)
     if not order:
         await callback.answer("Заказ не найден", show_alert=True)
@@ -592,7 +597,7 @@ async def cb_confirm_order(callback: CallbackQuery, db: Database) -> None:
 async def cb_cancel_order(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    order_id = int(callback.data.split(":")[2])
+    order_id = parse_callback_id(callback.data, "adm:cancel")
     order = await db.get_order(order_id)
     if not order:
         await callback.answer("Заказ не найден", show_alert=True)
