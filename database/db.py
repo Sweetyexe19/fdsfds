@@ -6,6 +6,7 @@ from typing import Any
 import aiosqlite
 
 from config import DATABASE_PATH, SOLD_EXPORT_DIR
+from services.catalog_nav import MAX_CATEGORY_DEPTH
 
 
 class Database:
@@ -35,6 +36,15 @@ class Database:
                     "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (admin_id,)
                 )
             await db.commit()
+            await self._migrate_categories(db)
+
+    async def _migrate_categories(self, db: aiosqlite.Connection) -> None:
+        async with db.execute("PRAGMA table_info(categories)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "parent_id" not in cols:
+            await db.execute(
+                "ALTER TABLE categories ADD COLUMN parent_id INTEGER DEFAULT NULL"
+            )
 
     async def _init_schema(self, db: aiosqlite.Connection) -> None:
         await db.executescript(
@@ -50,12 +60,14 @@ class Database:
 
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id INTEGER,
                 name TEXT NOT NULL,
                 description TEXT DEFAULT '',
-                price REAL NOT NULL,
+                price REAL NOT NULL DEFAULT 0,
                 is_active INTEGER DEFAULT 1,
                 sort_order INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (parent_id) REFERENCES categories(id)
             );
 
             CREATE TABLE IF NOT EXISTS products (
@@ -177,18 +189,7 @@ class Database:
             )
             await db.commit()
 
-    # --- Categories ---
-
-    async def get_categories(self, active_only: bool = True) -> list[dict]:
-        query = "SELECT * FROM categories"
-        if active_only:
-            query += " WHERE is_active = 1"
-        query += " ORDER BY sort_order, id"
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(query) as cur:
-                rows = await cur.fetchall()
-                return [dict(r) for r in rows]
+    # --- Categories (tree: категория → подкатегория → подподкатегория) ---
 
     async def get_category(self, category_id: int) -> dict | None:
         async with aiosqlite.connect(self.path) as db:
@@ -199,21 +200,89 @@ class Database:
                 row = await cur.fetchone()
                 return dict(row) if row else None
 
+    async def get_children(
+        self, parent_id: int | None = None, active_only: bool = True
+    ) -> list[dict]:
+        query = "SELECT * FROM categories WHERE "
+        params: list[Any] = []
+        if parent_id is None:
+            query += "parent_id IS NULL"
+        else:
+            query += "parent_id = ?"
+            params.append(parent_id)
+        if active_only:
+            query += " AND is_active = 1"
+        query += " ORDER BY sort_order, id"
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def get_categories(self, active_only: bool = True) -> list[dict]:
+        return await self.get_children(None, active_only=active_only)
+
+    async def has_children(self, category_id: int, active_only: bool = False) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            q = "SELECT 1 FROM categories WHERE parent_id = ?"
+            if active_only:
+                q += " AND is_active = 1"
+            q += " LIMIT 1"
+            async with db.execute(q, (category_id,)) as cur:
+                return await cur.fetchone() is not None
+
+    async def is_leaf(self, category_id: int) -> bool:
+        return not await self.has_children(category_id)
+
+    async def get_category_depth(self, category_id: int) -> int:
+        depth = 0
+        current_id = category_id
+        while True:
+            cat = await self.get_category(current_id)
+            if not cat or not cat.get("parent_id"):
+                return depth
+            depth += 1
+            current_id = cat["parent_id"]
+
+    async def can_add_child(self, category_id: int) -> bool:
+        if await self.get_category_depth(category_id) >= MAX_CATEGORY_DEPTH:
+            return False
+        if await self.has_children(category_id):
+            return False
+        if await self.is_leaf(category_id):
+            direct = await self.count_available(category_id)
+            if direct > 0:
+                return False
+        return True
+
+    async def get_category_path(self, category_id: int) -> str:
+        names: list[str] = []
+        current_id: int | None = category_id
+        while current_id:
+            cat = await self.get_category(current_id)
+            if not cat:
+                break
+            names.insert(0, cat["name"])
+            current_id = cat.get("parent_id")
+        return " → ".join(names) if names else ""
+
     async def create_category(
-        self, name: str, description: str, price: float
+        self,
+        name: str,
+        description: str,
+        price: float,
+        parent_id: int | None = None,
     ) -> int:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "INSERT INTO categories (name, description, price) VALUES (?, ?, ?)",
-                (name, description, price),
+                "INSERT INTO categories (name, description, price, parent_id) "
+                "VALUES (?, ?, ?, ?)",
+                (name, description, price, parent_id),
             )
             await db.commit()
             return cur.lastrowid
 
-    async def update_category(
-        self, category_id: int, **fields: Any
-    ) -> None:
-        allowed = {"name", "description", "price", "is_active", "sort_order"}
+    async def update_category(self, category_id: int, **fields: Any) -> None:
+        allowed = {"name", "description", "price", "is_active", "sort_order", "parent_id"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -226,19 +295,31 @@ class Database:
             await db.commit()
 
     async def delete_category(self, category_id: int) -> None:
+        children = await self.get_children(category_id, active_only=False)
+        for child in children:
+            await self.delete_category(child["id"])
         async with aiosqlite.connect(self.path) as db:
             await db.execute("DELETE FROM products WHERE category_id = ?", (category_id,))
+            await db.execute("DELETE FROM cart WHERE category_id = ?", (category_id,))
             await db.execute("DELETE FROM categories WHERE id = ?", (category_id,))
             await db.commit()
 
     async def count_available(self, category_id: int) -> int:
-        async with aiosqlite.connect(self.path) as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM products WHERE category_id = ? AND status = 'available'",
-                (category_id,),
-            ) as cur:
-                row = await cur.fetchone()
-                return row[0] if row else 0
+        if await self.is_leaf(category_id):
+            async with aiosqlite.connect(self.path) as db:
+                async with db.execute(
+                    "SELECT COUNT(*) FROM products WHERE category_id = ? AND status = 'available'",
+                    (category_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                    return row[0] if row else 0
+        total = 0
+        for child in await self.get_children(category_id, active_only=True):
+            total += await self.count_available(child["id"])
+        return total
+
+    async def count_available_map(self, category_ids: list[int]) -> dict[int, int]:
+        return {cid: await self.count_available(cid) for cid in category_ids}
 
     # --- Products ---
 
@@ -260,6 +341,8 @@ class Database:
         }
 
     async def bulk_add_products(self, category_id: int, lines: list[str]) -> int:
+        if not await self.is_leaf(category_id):
+            return 0
         added = 0
         async with aiosqlite.connect(self.path) as db:
             for line in lines:
@@ -576,10 +659,10 @@ class Database:
             return ""
         items = await self.get_order_items(order_id)
         total_qty = sum(i["quantity"] for i in items)
-        lines = [
-            f"• {i['category_name']} — {i['quantity']} шт. × {i['price']:.0f} ₽"
-            for i in items
-        ]
+        lines = []
+        for i in items:
+            path = await self.get_category_path(i["category_id"])
+            lines.append(f"• {path} — {i['quantity']} шт. × {i['price']:.0f} ₽")
         method = order["payment_method"]
         if method == "crypto" and order.get("crypto_asset"):
             from constants import CRYPTO_LABELS

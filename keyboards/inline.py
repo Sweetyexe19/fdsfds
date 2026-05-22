@@ -1,6 +1,8 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from services.catalog_nav import format_catalog_button
+
 
 def main_menu_kb(reviews_url: str, support_username: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -29,21 +31,35 @@ def main_menu_kb(reviews_url: str, support_username: str) -> InlineKeyboardMarku
     return builder.as_markup()
 
 
-def catalog_kb(categories: list[dict], counts: dict[int, int]) -> InlineKeyboardMarkup:
+def catalog_kb(
+    categories: list[dict],
+    counts: dict[int, int],
+    leaves: dict[int, bool],
+    parent_id: int | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for cat in categories:
-        count = counts.get(cat["id"], 0)
-        builder.row(
-            InlineKeyboardButton(
-                text=f"{cat['name']} — {cat['price']:.0f}₽ ({count} шт.)",
-                callback_data=f"cat:{cat['id']}",
-            )
+        cid = cat["id"]
+        is_leaf = leaves.get(cid, True)
+        label = format_catalog_button(
+            cat["name"],
+            is_leaf=is_leaf,
+            price=cat.get("price") or 0,
+            count=counts.get(cid, 0),
         )
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="main"))
+        builder.row(
+            InlineKeyboardButton(text=label, callback_data=f"cat:{cid}"),
+        )
+    if parent_id:
+        builder.row(
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"cat_back:{parent_id}"),
+        )
+    else:
+        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="main"))
     return builder.as_markup()
 
 
-def category_detail_kb(category_id: int) -> InlineKeyboardMarkup:
+def category_detail_kb(category_id: int, parent_id: int | None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
@@ -53,8 +69,13 @@ def category_detail_kb(category_id: int) -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(text="🧺 Корзина", callback_data="cart"),
-        InlineKeyboardButton(text="◀️ Каталог", callback_data="buy"),
     )
+    if parent_id:
+        builder.row(
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"cat_back:{parent_id}"),
+        )
+    else:
+        builder.row(InlineKeyboardButton(text="◀️ Каталог", callback_data="buy"))
     builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="main"))
     return builder.as_markup()
 
@@ -62,9 +83,10 @@ def category_detail_kb(category_id: int) -> InlineKeyboardMarkup:
 def cart_kb(items: list[dict]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for item in items:
+        name = item.get("path") or item.get("name", "Товар")
         builder.row(
             InlineKeyboardButton(
-                text=f"❌ {item['name']} x{item['quantity']}",
+                text=f"❌ {name} x{item['quantity']}",
                 callback_data=f"cart_remove:{item['category_id']}",
             )
         )
@@ -178,44 +200,137 @@ def admin_main_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def admin_categories_kb(categories: list[dict]) -> InlineKeyboardMarkup:
+def admin_categories_kb(
+    categories: list[dict],
+    *,
+    container_id: int | None = None,
+    back_callback: str = "adm:categories",
+    leaves: dict[int, bool] | None = None,
+    counts: dict[int, int] | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="➕ Новая категория", callback_data="adm:cat_new"),
-    )
-    for cat in categories:
-        status = "✅" if cat["is_active"] else "❌"
+    if container_id is None:
+        builder.row(
+            InlineKeyboardButton(text="➕ Категория", callback_data="adm:cat_new"),
+        )
+    else:
         builder.row(
             InlineKeyboardButton(
-                text=f"{status} {cat['name']} ({cat['price']:.0f}₽)",
+                text="➕ Подкатегория",
+                callback_data=f"adm:cat_new:{container_id}",
+            ),
+        )
+    leaves = leaves or {}
+    counts = counts or {}
+    for cat in categories:
+        status = "✅" if cat["is_active"] else "❌"
+        if leaves.get(cat["id"], True) and (cat.get("price") or 0) > 0:
+            extra = f" ({cat['price']:.0f}₽, {counts.get(cat['id'], 0)} шт.)"
+        elif leaves.get(cat["id"], True):
+            extra = f" ({counts.get(cat['id'], 0)} шт.)"
+        else:
+            extra = " →"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{status} {cat['name']}{extra}",
                 callback_data=f"adm:cat:{cat['id']}",
             )
         )
+    builder.row(
+        InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback),
+    )
     builder.row(InlineKeyboardButton(text="◀️ Админ", callback_data="adm:main"))
     return builder.as_markup()
 
 
-def admin_category_kb(category_id: int, is_active: bool) -> InlineKeyboardMarkup:
+def admin_category_kb(
+    category_id: int,
+    is_active: bool,
+    *,
+    is_leaf: bool,
+    can_add_child: bool,
+    parent_id: int | None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:edit:{category_id}:name"),
         InlineKeyboardButton(text="📝 Описание", callback_data=f"adm:edit:{category_id}:description"),
     )
-    builder.row(
-        InlineKeyboardButton(text="💰 Цена", callback_data=f"adm:edit:{category_id}:price"),
-        InlineKeyboardButton(
-            text="🔴 Деактивировать" if is_active else "🟢 Активировать",
-            callback_data=f"adm:toggle:{category_id}",
-        ),
-    )
-    builder.row(
-        InlineKeyboardButton(text="📤 Загрузить TXT", callback_data=f"adm:upload:{category_id}"),
-        InlineKeyboardButton(text="📋 Товары", callback_data=f"adm:products:{category_id}"),
-    )
+    if is_leaf:
+        builder.row(
+            InlineKeyboardButton(text="💰 Цена", callback_data=f"adm:edit:{category_id}:price"),
+            InlineKeyboardButton(
+                text="🔴 Выкл." if is_active else "🟢 Вкл.",
+                callback_data=f"adm:toggle:{category_id}",
+            ),
+        )
+        builder.row(
+            InlineKeyboardButton(text="📤 Загрузить TXT", callback_data=f"adm:upload:{category_id}"),
+            InlineKeyboardButton(text="📋 Товары", callback_data=f"adm:products:{category_id}"),
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(
+                text="🔴 Выкл." if is_active else "🟢 Вкл.",
+                callback_data=f"adm:toggle:{category_id}",
+            ),
+            InlineKeyboardButton(
+                text="📂 Подкатегории",
+                callback_data=f"adm:children:{category_id}",
+            ),
+        )
+    if can_add_child:
+        builder.row(
+            InlineKeyboardButton(
+                text="➕ Подкатегория",
+                callback_data=f"adm:cat_new:{category_id}",
+            ),
+        )
     builder.row(
         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:del:{category_id}"),
     )
-    builder.row(InlineKeyboardButton(text="◀️ Категории", callback_data="adm:categories"))
+    if parent_id:
+        builder.row(
+            InlineKeyboardButton(
+                text="◀️ Назад",
+                callback_data=f"adm:children:{parent_id}",
+            ),
+        )
+    else:
+        builder.row(InlineKeyboardButton(text="◀️ Категории", callback_data="adm:categories"))
+    return builder.as_markup()
+
+
+def admin_upload_pick_kb(
+    categories: list[dict],
+    leaves: dict[int, bool],
+    parent_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for cat in categories:
+        if not leaves.get(cat["id"], False):
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"{cat['name']} →",
+                    callback_data=f"adm:upload_nav:{cat['id']}",
+                ),
+            )
+        else:
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"📤 {cat['name']}",
+                    callback_data=f"adm:upload:{cat['id']}",
+                ),
+            )
+    if parent_id is not None:
+        builder.row(
+            InlineKeyboardButton(
+                text="◀️ Назад",
+                callback_data=f"adm:upload_back:{parent_id}",
+            ),
+        )
+    else:
+        builder.row(InlineKeyboardButton(text="◀️ Админ", callback_data="adm:main"))
     return builder.as_markup()
 
 

@@ -15,10 +15,12 @@ from keyboards.inline import (
     admin_settings_kb,
     back_main_kb,
 )
+from services.catalog_nav import level_name
 from services.delivery import deliver_order
 from services.encryption import DataEncryptor
 from services.sold_archive import archive_exists, clear_archive, get_archive_path
 from states import AdminCategory, AdminManualSell, AdminProducts, AdminSeed, AdminSettings
+from keyboards.inline import admin_upload_pick_kb
 
 router = Router()
 
@@ -45,57 +47,132 @@ async def cb_admin_main(callback: CallbackQuery, db: Database) -> None:
     await callback.answer()
 
 
+async def _admin_list_categories(
+    callback: CallbackQuery,
+    db: Database,
+    container_id: int | None,
+    title: str,
+    back_callback: str,
+) -> None:
+    categories = await db.get_children(container_id, active_only=False)
+    ids = [c["id"] for c in categories]
+    leaves = {cid: await db.is_leaf(cid) for cid in ids}
+    counts = await db.count_available_map(ids)
+    await callback.message.edit_text(
+        title,
+        reply_markup=admin_categories_kb(
+            categories,
+            container_id=container_id,
+            back_callback=back_callback,
+            leaves=leaves,
+            counts=counts,
+        ),
+    )
+
+
 @router.callback_query(F.data == "adm:categories")
 async def cb_admin_categories(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    categories = await db.get_categories(active_only=False)
-    await callback.message.edit_text(
-        "📁 <b>Категории</b>", reply_markup=admin_categories_kb(categories)
+    await _admin_list_categories(
+        callback, db, None, "📁 <b>Категории</b>", "adm:main"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:children:"))
+async def cb_admin_children(callback: CallbackQuery, db: Database) -> None:
+    if not await db.is_admin(callback.from_user.id):
+        return
+    container_id = int(callback.data.split(":")[2])
+    cat = await db.get_category(container_id)
+    if not cat:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    path = await db.get_category_path(container_id)
+    parent = cat.get("parent_id")
+    back = "adm:categories" if parent is None else f"adm:children:{parent}"
+    await _admin_list_categories(
+        callback, db, container_id, f"📁 <b>{path}</b>\n\nПодразделы:", back
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "adm:cat_new")
-async def cb_cat_new(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+async def cb_cat_new_root(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
     await state.set_state(AdminCategory.name)
-    await callback.message.answer("Введите название категории:")
+    await state.update_data(parent_id=None)
+    await callback.message.answer(f"Введите название {level_name(0)}:")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:cat_new:"))
+async def cb_cat_new_child(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    if not await db.is_admin(callback.from_user.id):
+        return
+    parent_id = int(callback.data.split(":")[3])
+    if not await db.can_add_child(parent_id):
+        await callback.answer("Нельзя добавить подраздел", show_alert=True)
+        return
+    parent = await db.get_category(parent_id)
+    depth = await db.get_category_depth(parent_id) + 1
+    await state.set_state(AdminCategory.name)
+    await state.update_data(parent_id=parent_id)
+    await callback.message.answer(
+        f"Новая {level_name(depth)} в «{parent['name']}».\nВведите название:"
+    )
     await callback.answer()
 
 
 @router.message(AdminCategory.name)
-async def admin_cat_name(message: Message, state: FSMContext) -> None:
+async def admin_cat_name(message: Message, state: FSMContext, db: Database) -> None:
     await state.update_data(name=message.text.strip())
     await state.set_state(AdminCategory.description)
-    await message.answer("Введите описание категории:")
+    await message.answer("Введите описание:")
 
 
 @router.message(AdminCategory.description)
-async def admin_cat_description(message: Message, state: FSMContext) -> None:
+async def admin_cat_description(message: Message, state: FSMContext, db: Database) -> None:
     await state.update_data(description=message.text.strip())
+    data = await state.get_data()
+    parent_id = data.get("parent_id")
+    if parent_id and not await db.can_add_child(parent_id):
+        await state.clear()
+        await message.answer("❌ Достигнут максимальный уровень вложенности")
+        return
     await state.set_state(AdminCategory.price)
-    await message.answer("Введите цену за канал (в рублях):")
+    await message.answer(
+        "Введите цену за канал в рублях:\n"
+        "(0 — если планируете добавить подкатегории без товаров здесь)"
+    )
 
 
 @router.message(AdminCategory.price)
 async def admin_cat_price(message: Message, state: FSMContext, db: Database) -> None:
     try:
         price = float(message.text.replace(",", ".").strip())
-        if price <= 0:
+        if price < 0:
             raise ValueError
     except ValueError:
-        await message.answer("Введите корректную цену:")
+        await message.answer("Введите корректную цену (0 или больше):")
         return
     data = await state.get_data()
-    cat_id = await db.create_category(data["name"], data["description"], price)
+    parent_id = data.get("parent_id")
+    cat_id = await db.create_category(
+        data["name"], data["description"], price, parent_id=parent_id
+    )
     await state.clear()
+    path = await db.get_category_path(cat_id)
+    hint = (
+        "Добавьте подкатегории или загрузите TXT на этот уровень."
+        if price == 0
+        else "Загрузите товары: /admin → Загрузить TXT"
+    )
     await message.answer(
-        f"✅ Категория создана (ID: {cat_id})\n\n"
-        f"Загрузите товары: /admin → Загрузить TXT\n"
-        f"Формат строки:\n"
-        f"<code>логин:пароль:резервка:пароль:ключ2фа:ссылка</code>",
+        f"✅ Создано: <b>{path}</b> (ID: {cat_id})\n\n{hint}\n\n"
+        f"Формат: <code>логин:пароль:резервка:пароль:ключ2фа:ссылка</code>",
         reply_markup=admin_main_kb(),
     )
 
@@ -109,14 +186,36 @@ async def cb_admin_cat_detail(callback: CallbackQuery, db: Database) -> None:
     if not cat:
         await callback.answer("Не найдено", show_alert=True)
         return
+    path = await db.get_category_path(category_id)
+    is_leaf = await db.is_leaf(category_id)
+    can_child = await db.can_add_child(category_id)
     count = await db.count_available(category_id)
-    text = (
-        f"📦 <b>{cat['name']}</b> (ID: {cat['id']})\n\n"
-        f"{cat['description']}\n\n"
-        f"💰 {cat['price']:.0f} ₽ | 📊 {count} шт. в наличии"
-    )
+    depth = await db.get_category_depth(category_id)
+
+    if is_leaf:
+        price = cat.get("price") or 0
+        text = (
+            f"📦 <b>{path}</b> (ID: {cat['id']})\n"
+            f"Уровень: {level_name(depth)}\n\n"
+            f"{cat['description']}\n\n"
+            f"💰 {price:.0f} ₽ | 📊 {count} шт."
+        )
+    else:
+        text = (
+            f"📁 <b>{path}</b> (ID: {cat['id']})\n"
+            f"Уровень: {level_name(depth)} (есть подразделы)\n\n"
+            f"{cat['description']}\n\n"
+            f"📊 Всего в разделе: {count} шт."
+        )
     await callback.message.edit_text(
-        text, reply_markup=admin_category_kb(category_id, bool(cat["is_active"]))
+        text,
+        reply_markup=admin_category_kb(
+            category_id,
+            bool(cat["is_active"]),
+            is_leaf=is_leaf,
+            can_add_child=can_child,
+            parent_id=cat.get("parent_id"),
+        ),
     )
     await callback.answer()
 
@@ -170,20 +269,58 @@ async def admin_edit_value(message: Message, state: FSMContext, db: Database) ->
     await message.answer("✅ Обновлено", reply_markup=admin_main_kb())
 
 
+async def _admin_upload_picker(
+    callback: CallbackQuery,
+    db: Database,
+    container_id: int | None,
+    back_callback: str,
+) -> None:
+    categories = await db.get_children(container_id, active_only=False)
+    if not categories:
+        await callback.message.edit_text(
+            "Нет разделов. Создайте категорию.",
+            reply_markup=admin_main_kb(),
+        )
+        return
+    ids = [c["id"] for c in categories]
+    leaves = {cid: await db.is_leaf(cid) for cid in ids}
+    await callback.message.edit_text(
+        "📦 <b>Загрузка товаров</b>\n\nВыберите раздел (лист с товарами):",
+        reply_markup=admin_upload_pick_kb(
+            categories, leaves, parent_id=container_id
+        ),
+    )
+
+
 @router.callback_query(F.data == "adm:upload")
 async def cb_upload_menu(callback: CallbackQuery, db: Database) -> None:
     if not await db.is_admin(callback.from_user.id):
         return
-    categories = await db.get_categories(active_only=False)
-    if not categories:
+    root = await db.get_children(None, active_only=False)
+    if not root:
         await callback.answer("Сначала создайте категорию", show_alert=True)
         return
-    from keyboards.inline import admin_categories_kb
+    await _admin_upload_picker(callback, db, None, "adm:main")
+    await callback.answer()
 
-    await callback.message.edit_text(
-        "Выберите категорию для загрузки товаров:",
-        reply_markup=admin_categories_kb(categories),
-    )
+
+@router.callback_query(F.data.startswith("adm:upload_nav:"))
+async def cb_upload_nav(callback: CallbackQuery, db: Database) -> None:
+    if not await db.is_admin(callback.from_user.id):
+        return
+    container_id = int(callback.data.split(":")[2])
+    await _admin_upload_picker(callback, db, container_id, f"adm:upload_back:{container_id}")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:upload_back:"))
+async def cb_upload_back(callback: CallbackQuery, db: Database) -> None:
+    if not await db.is_admin(callback.from_user.id):
+        return
+    ref_id = int(callback.data.split(":")[2])
+    cat = await db.get_category(ref_id)
+    list_parent = cat.get("parent_id") if cat else None
+    await _admin_upload_picker(callback, db, list_parent, "adm:main")
     await callback.answer()
 
 
@@ -192,12 +329,19 @@ async def cb_upload_category(callback: CallbackQuery, state: FSMContext, db: Dat
     if not await db.is_admin(callback.from_user.id):
         return
     category_id = int(callback.data.split(":")[2])
+    if not await db.is_leaf(category_id):
+        await callback.answer(
+            "Загрузка только в конечный раздел без подкатегорий",
+            show_alert=True,
+        )
+        return
+    path = await db.get_category_path(category_id)
     await state.set_state(AdminProducts.waiting_file)
     await state.update_data(category_id=category_id)
     await callback.message.answer(
-        "Отправьте TXT-файл.\n"
-        "1 строка = 1 товар\n"
-        "Формат: <code>логин:пароль:резервка:пароль:ключ2фа:ссылка</code>"
+        f"📤 Загрузка в <b>{path}</b>\n\n"
+        "Отправьте TXT-файл (1 строка = 1 товар):\n"
+        "<code>логин:пароль:резервка:пароль:ключ2фа:ссылка</code>"
     )
     await callback.answer()
 
@@ -212,10 +356,15 @@ async def admin_upload_file(message: Message, state: FSMContext, db: Database) -
     file = await message.bot.download(message.document)
     content = file.read().decode("utf-8", errors="ignore")
     lines = content.splitlines()
+    if not await db.is_leaf(category_id):
+        await state.clear()
+        await message.answer("❌ Загрузка только в конечный раздел", reply_markup=admin_main_kb())
+        return
     added = await db.bulk_add_products(category_id, lines)
+    path = await db.get_category_path(category_id)
     await state.clear()
     await message.answer(
-        f"✅ Загружено {added} товаров из {len(lines)} строк",
+        f"✅ В <b>{path}</b> загружено {added} из {len(lines)} строк",
         reply_markup=admin_main_kb(),
     )
 

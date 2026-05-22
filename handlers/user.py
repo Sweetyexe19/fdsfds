@@ -80,21 +80,56 @@ async def cb_support(callback: CallbackQuery, db: Database) -> None:
     await callback.answer()
 
 
+async def _show_catalog(
+    callback: CallbackQuery,
+    db: Database,
+    parent_id: int | None,
+    title: str,
+) -> None:
+    categories = await db.get_children(parent_id)
+    if not categories:
+        await callback.message.edit_text(
+            "Раздел пуст. Загляните позже!",
+            reply_markup=back_main_kb(),
+        )
+        return
+    ids = [c["id"] for c in categories]
+    leaves = {cid: await db.is_leaf(cid) for cid in ids}
+    counts = await db.count_available_map(ids)
+    await callback.message.edit_text(
+        title,
+        reply_markup=catalog_kb(categories, counts, leaves, parent_id=parent_id),
+    )
+
+
 @router.callback_query(F.data == "buy")
 async def cb_buy(callback: CallbackQuery, db: Database) -> None:
-    categories = await db.get_categories()
-    if not categories:
+    root = await db.get_children(None)
+    if not root:
         await callback.message.edit_text(
             "Каталог пуст. Загляните позже!",
             reply_markup=back_main_kb(),
         )
         await callback.answer()
         return
-    counts = {c["id"]: await db.count_available(c["id"]) for c in categories}
-    text = "📁 <b>Каталог каналов</b>\n\nВыберите категорию:"
-    await callback.message.edit_text(
-        text, reply_markup=catalog_kb(categories, counts)
-    )
+    await _show_catalog(callback, db, None, "📁 <b>Каталог</b>\n\nВыберите категорию:")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cat_back:"))
+async def cb_cat_back(callback: CallbackQuery, db: Database) -> None:
+    ref_id = int(callback.data.split(":")[1])
+    cat = await db.get_category(ref_id)
+    if not cat:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    list_parent = cat.get("parent_id")
+    if list_parent:
+        parent_cat = await db.get_category(list_parent)
+        title = f"📁 <b>{parent_cat['name']}</b>\n\nВыберите раздел:"
+    else:
+        title = "📁 <b>Каталог</b>\n\nВыберите категорию:"
+    await _show_catalog(callback, db, list_parent, title)
     await callback.answer()
 
 
@@ -105,15 +140,40 @@ async def cb_category(callback: CallbackQuery, db: Database) -> None:
     if not cat:
         await callback.answer("Категория не найдена", show_alert=True)
         return
+
+    if not await db.is_leaf(category_id):
+        children = await db.get_children(category_id)
+        if not children:
+            await callback.answer("Раздел пуст", show_alert=True)
+            return
+        ids = [c["id"] for c in children]
+        leaves = {cid: await db.is_leaf(cid) for cid in ids}
+        counts = await db.count_available_map(ids)
+        path = await db.get_category_path(category_id)
+        await callback.message.edit_text(
+            f"📁 <b>{path}</b>\n\nВыберите подраздел:",
+            reply_markup=catalog_kb(
+                children, counts, leaves, parent_id=category_id
+            ),
+        )
+        await callback.answer()
+        return
+
     count = await db.count_available(category_id)
+    path = await db.get_category_path(category_id)
+    price = cat.get("price") or 0
+    price_line = (
+        f"💰 Цена: <b>{price:.0f} ₽</b> за канал\n" if price > 0 else ""
+    )
     text = (
-        f"📦 <b>{cat['name']}</b>\n\n"
+        f"📦 <b>{path}</b>\n\n"
         f"{cat['description']}\n\n"
-        f"💰 Цена: <b>{cat['price']:.0f} ₽</b> за канал\n"
+        f"{price_line}"
         f"📊 В наличии: <b>{count}</b> шт."
     )
     await callback.message.edit_text(
-        text, reply_markup=category_detail_kb(category_id)
+        text,
+        reply_markup=category_detail_kb(category_id, cat.get("parent_id")),
     )
     await callback.answer()
 
@@ -121,6 +181,9 @@ async def cb_category(callback: CallbackQuery, db: Database) -> None:
 @router.callback_query(F.data.startswith("add:"))
 async def cb_add_to_cart(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     category_id = int(callback.data.split(":")[1])
+    if not await db.is_leaf(category_id):
+        await callback.answer("Выберите конечный раздел с товарами", show_alert=True)
+        return
     count = await db.count_available(category_id)
     if count == 0:
         await callback.answer("Нет в наличии", show_alert=True)
@@ -152,10 +215,11 @@ async def process_quantity(message: Message, state: FSMContext, db: Database) ->
     await state.clear()
     if ok:
         cat = await db.get_category(category_id)
-        total = qty * cat["price"]
+        path = await db.get_category_path(category_id)
+        total = qty * (cat.get("price") or 0)
         await message.answer(
             f"✅ {msg}\n\n"
-            f"<b>{cat['name']}</b> x{qty} = {total:.0f} ₽\n\n"
+            f"<b>{path}</b> x{qty} = {total:.0f} ₽\n\n"
             f"Перейдите в корзину для оплаты.",
             reply_markup=cart_kb(await db.get_cart(message.from_user.id)),
         )
@@ -175,16 +239,19 @@ async def cb_cart(callback: CallbackQuery, db: Database) -> None:
         return
     lines = []
     total = 0.0
+    cart_items = []
     for item in items:
         subtotal = item["quantity"] * item["price"]
         total += subtotal
         avail = await db.count_available(item["category_id"])
+        path = await db.get_category_path(item["category_id"])
         lines.append(
-            f"• <b>{item['name']}</b> x{item['quantity']} = {subtotal:.0f} ₽ "
+            f"• <b>{path}</b> x{item['quantity']} = {subtotal:.0f} ₽ "
             f"(доступно: {avail})"
         )
+        cart_items.append({**item, "path": path})
     text = "🧺 <b>Корзина</b>\n\n" + "\n".join(lines) + f"\n\n💰 <b>Итого: {total:.0f} ₽</b>"
-    await callback.message.edit_text(text, reply_markup=cart_kb(items))
+    await callback.message.edit_text(text, reply_markup=cart_kb(cart_items))
     await callback.answer()
 
 
