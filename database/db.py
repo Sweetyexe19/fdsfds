@@ -139,6 +139,7 @@ class Database:
                 "3. Покупатель обязан сменить все пароли после получения\n"
                 "4. Администрация не несёт ответственности за действия покупателя с аккаунтом"
             ),
+            "delivery_instruction_text": __import__("config").DELIVERY_INSTRUCTION,
             "crypto_usdt_trc20": "",
             "crypto_usdt_bep20": "",
             "crypto_usdt_erc20": "",

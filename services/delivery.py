@@ -23,10 +23,18 @@ async def deliver_order(bot: Bot, db: Database, order_id: int, user_id: int) -> 
         else:
             current += block
     chunks.append(current)
-    chunks.append(DELIVERY_INSTRUCTION)
+    instruction = await db.get_setting("delivery_instruction_text")
+    if not instruction:
+        instruction = DELIVERY_INSTRUCTION
+    chunks.append(instruction)
 
-    for text in chunks:
-        await bot.send_message(user_id, text)
+    from keyboards.reply import main_reply_kb
+
+    for i, text in enumerate(chunks):
+        kwargs = {}
+        if i == len(chunks) - 1:
+            kwargs["reply_markup"] = main_reply_kb()
+        await bot.send_message(user_id, text, **kwargs)
 
     return True
 

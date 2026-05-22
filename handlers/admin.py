@@ -15,7 +15,6 @@ from keyboards.inline import (
     admin_main_kb,
     admin_order_kb,
     admin_settings_kb,
-    back_main_kb,
 )
 from services.catalog_nav import add_child_button_label, level_name
 from services.delivery import deliver_order
@@ -465,7 +464,16 @@ async def cb_set_setting(callback: CallbackQuery, state: FSMContext, db: Databas
     key = callback.data.split(":")[2]
     await state.set_state(AdminSettings.waiting_value)
     await state.update_data(setting_key=key)
-    await callback.message.answer(f"Введите новое значение для «{key}»:")
+    labels = {
+        "welcome_text": "приветствие",
+        "reviews_url": "ссылку на отзывы",
+        "support_username": "username поддержки",
+        "guarantees_text": "текст гарантий",
+        "agreement_text": "текст соглашения",
+        "delivery_instruction_text": "текст инструкции после покупки (можно несколько строк)",
+    }
+    label = labels.get(key, key)
+    await callback.message.answer(f"Введите новое значение — <b>{label}</b>:")
     await callback.answer()
 
 

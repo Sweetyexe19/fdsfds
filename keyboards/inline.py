@@ -4,33 +4,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from services.catalog_nav import format_catalog_button
 
 
-def main_menu_kb(reviews_url: str, support_username: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="🛒 Купить канал", callback_data="buy"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="⭐ Отзывы", url=reviews_url),
-    )
-    builder.row(InlineKeyboardButton(text="🧺 Корзина", callback_data="cart"))
-    if support_username:
-        builder.row(
-            InlineKeyboardButton(
-                text="💬 Поддержка",
-                url=f"https://t.me/{support_username}",
-            )
-        )
-    else:
-        builder.row(
-            InlineKeyboardButton(text="💬 Поддержка", callback_data="support"),
-        )
-    builder.row(
-        InlineKeyboardButton(text="🛡 Гарантии", callback_data="guarantees"),
-        InlineKeyboardButton(text="📜 Соглашение", callback_data="agreement"),
-    )
-    return builder.as_markup()
-
-
 def catalog_kb(
     categories: list[dict],
     counts: dict[int, int],
@@ -343,6 +316,7 @@ def admin_settings_kb() -> InlineKeyboardMarkup:
         ("support_username", "Поддержка"),
         ("guarantees_text", "Гарантии"),
         ("agreement_text", "Соглашение"),
+        ("delivery_instruction_text", "Инструкция после покупки"),
     ]
     for key, label in keys:
         builder.row(

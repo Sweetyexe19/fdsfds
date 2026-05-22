@@ -7,14 +7,21 @@ from config import ADMIN_IDS
 from constants import CRYPTO_LABELS, CRYPTO_NETWORKS
 from database import Database
 from keyboards.inline import (
-    back_main_kb,
     cart_kb,
     catalog_kb,
     category_detail_kb,
     crypto_assets_kb,
-    main_menu_kb,
     payment_methods_kb,
     payment_order_kb,
+)
+from keyboards.reply import (
+    BTN_AGREEMENT,
+    BTN_BUY,
+    BTN_CART,
+    BTN_GUARANTEES,
+    BTN_REVIEWS,
+    BTN_SUPPORT,
+    main_reply_kb,
 )
 from services.delivery import deliver_order, notify_admins_payment_check
 from services.yookassa_pay import YooKassaPayment
@@ -23,97 +30,144 @@ from states import BuyQuantity
 router = Router()
 
 
-async def show_main(message: Message, db: Database, edit: bool = False) -> None:
+async def send_main_menu(message: Message, db: Database) -> None:
     welcome = await db.get_setting("welcome_text")
-    reviews = await db.get_setting("reviews_url")
-    support = await db.get_setting("support_username")
-    kb = main_menu_kb(reviews, support)
-    if edit and hasattr(message, "edit_text"):
-        await message.edit_text(welcome, reply_markup=kb)
-    else:
-        await message.answer(welcome, reply_markup=kb)
+    await message.answer(welcome, reply_markup=main_reply_kb())
+
+
+async def go_main_from_callback(callback: CallbackQuery, db: Database) -> None:
+    await callback.answer()
+    await send_main_menu(callback.message, db)
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, db: Database) -> None:
-    await show_main(message, db)
+    await send_main_menu(message, db)
 
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, db: Database) -> None:
-    await show_main(message, db)
+    await send_main_menu(message, db)
 
 
 @router.callback_query(F.data == "main")
 async def cb_main(callback: CallbackQuery, db: Database) -> None:
-    await show_main(callback.message, db, edit=True)
-    await callback.answer()
+    await go_main_from_callback(callback, db)
 
 
-@router.callback_query(F.data == "guarantees")
-async def cb_guarantees(callback: CallbackQuery, db: Database) -> None:
-    text = await db.get_setting("guarantees_text")
-    await callback.message.edit_text(text, reply_markup=back_main_kb())
-    await callback.answer()
+@router.message(F.text == BTN_BUY)
+async def menu_buy(message: Message, db: Database) -> None:
+    root = await db.get_children(None)
+    if not root:
+        await message.answer(
+            "Каталог пуст. Загляните позже!",
+            reply_markup=main_reply_kb(),
+        )
+        return
+    await _send_catalog(
+        message, db, None, "📁 <b>Каталог</b>\n\nВыберите категорию:"
+    )
 
 
-@router.callback_query(F.data == "agreement")
-async def cb_agreement(callback: CallbackQuery, db: Database) -> None:
-    text = await db.get_setting("agreement_text")
-    await callback.message.edit_text(text, reply_markup=back_main_kb())
-    await callback.answer()
+@router.message(F.text == BTN_REVIEWS)
+async def menu_reviews(message: Message, db: Database) -> None:
+    url = await db.get_setting("reviews_url")
+    await message.answer(
+        f'⭐ <b>Отзывы</b>\n\n<a href="{url}">Перейти в группу с отзывами</a>',
+        reply_markup=main_reply_kb(),
+    )
 
 
-@router.callback_query(F.data == "support")
-async def cb_support(callback: CallbackQuery, db: Database) -> None:
+@router.message(F.text == BTN_CART)
+async def menu_cart(message: Message, db: Database) -> None:
+    await _send_cart(message, message.from_user.id, db)
+
+
+@router.message(F.text == BTN_SUPPORT)
+async def menu_support(message: Message, db: Database) -> None:
     support = await db.get_setting("support_username")
     if support:
-        await callback.message.edit_text(
-            f"Напишите в поддержку: @{support}",
-            reply_markup=back_main_kb(),
+        await message.answer(
+            f"💬 <b>Поддержка</b>\n\nНапишите: @{support}",
+            reply_markup=main_reply_kb(),
         )
     else:
-        await callback.message.edit_text(
+        await message.answer(
             "Поддержка не настроена. Обратитесь к администратору.",
-            reply_markup=back_main_kb(),
+            reply_markup=main_reply_kb(),
         )
-    await callback.answer()
 
 
-async def _show_catalog(
-    callback: CallbackQuery,
+@router.message(F.text == BTN_GUARANTEES)
+async def menu_guarantees(message: Message, db: Database) -> None:
+    text = await db.get_setting("guarantees_text")
+    await message.answer(text, reply_markup=main_reply_kb())
+
+
+@router.message(F.text == BTN_AGREEMENT)
+async def menu_agreement(message: Message, db: Database) -> None:
+    text = await db.get_setting("agreement_text")
+    await message.answer(text, reply_markup=main_reply_kb())
+
+
+async def _send_catalog(
+    message: Message,
     db: Database,
     parent_id: int | None,
     title: str,
 ) -> None:
     categories = await db.get_children(parent_id)
     if not categories:
-        await callback.message.edit_text(
+        await message.answer(
             "Раздел пуст. Загляните позже!",
-            reply_markup=back_main_kb(),
+            reply_markup=main_reply_kb(),
         )
         return
     ids = [c["id"] for c in categories]
     leaves = {cid: await db.is_leaf(cid) for cid in ids}
     counts = await db.count_available_map(ids)
-    await callback.message.edit_text(
+    await message.answer(
         title,
         reply_markup=catalog_kb(categories, counts, leaves, parent_id=parent_id),
     )
+
+
+async def _send_cart(message: Message, user_id: int, db: Database) -> None:
+    items = await db.get_cart(user_id)
+    if not items:
+        await message.answer("🧺 Корзина пуста", reply_markup=main_reply_kb())
+        return
+    lines = []
+    total = 0.0
+    cart_items = []
+    for item in items:
+        subtotal = item["quantity"] * item["price"]
+        total += subtotal
+        avail = await db.count_available(item["category_id"])
+        path = await db.get_category_path(item["category_id"])
+        lines.append(
+            f"• <b>{path}</b> x{item['quantity']} = {subtotal:.0f} ₽ "
+            f"(доступно: {avail})"
+        )
+        cart_items.append({**item, "path": path})
+    text = "🧺 <b>Корзина</b>\n\n" + "\n".join(lines) + f"\n\n💰 <b>Итого: {total:.0f} ₽</b>"
+    await message.answer(text, reply_markup=cart_kb(cart_items))
 
 
 @router.callback_query(F.data == "buy")
 async def cb_buy(callback: CallbackQuery, db: Database) -> None:
     root = await db.get_children(None)
     if not root:
-        await callback.message.edit_text(
+        await callback.answer("Каталог пуст", show_alert=True)
+        await callback.message.answer(
             "Каталог пуст. Загляните позже!",
-            reply_markup=back_main_kb(),
+            reply_markup=main_reply_kb(),
         )
-        await callback.answer()
         return
-    await _show_catalog(callback, db, None, "📁 <b>Каталог</b>\n\nВыберите категорию:")
     await callback.answer()
+    await _send_catalog(
+        callback.message, db, None, "📁 <b>Каталог</b>\n\nВыберите категорию:"
+    )
 
 
 @router.callback_query(F.data.startswith("cat_back:"))
@@ -129,8 +183,8 @@ async def cb_cat_back(callback: CallbackQuery, db: Database) -> None:
         title = f"📁 <b>{parent_cat['name']}</b>\n\nВыберите раздел:"
     else:
         title = "📁 <b>Каталог</b>\n\nВыберите категорию:"
-    await _show_catalog(callback, db, list_parent, title)
     await callback.answer()
+    await _send_catalog(callback.message, db, list_parent, title)
 
 
 @router.callback_query(F.data.startswith("cat:"))
@@ -229,30 +283,8 @@ async def process_quantity(message: Message, state: FSMContext, db: Database) ->
 
 @router.callback_query(F.data == "cart")
 async def cb_cart(callback: CallbackQuery, db: Database) -> None:
-    items = await db.get_cart(callback.from_user.id)
-    if not items:
-        await callback.message.edit_text(
-            "🧺 Корзина пуста",
-            reply_markup=back_main_kb(),
-        )
-        await callback.answer()
-        return
-    lines = []
-    total = 0.0
-    cart_items = []
-    for item in items:
-        subtotal = item["quantity"] * item["price"]
-        total += subtotal
-        avail = await db.count_available(item["category_id"])
-        path = await db.get_category_path(item["category_id"])
-        lines.append(
-            f"• <b>{path}</b> x{item['quantity']} = {subtotal:.0f} ₽ "
-            f"(доступно: {avail})"
-        )
-        cart_items.append({**item, "path": path})
-    text = "🧺 <b>Корзина</b>\n\n" + "\n".join(lines) + f"\n\n💰 <b>Итого: {total:.0f} ₽</b>"
-    await callback.message.edit_text(text, reply_markup=cart_kb(cart_items))
     await callback.answer()
+    await _send_cart(callback.message, callback.from_user.id, db)
 
 
 @router.callback_query(F.data.startswith("cart_remove:"))
@@ -416,11 +448,11 @@ async def cb_check_yookassa(
         return
     ok = await deliver_order(callback.bot, db, order_id, order["user_id"])
     if ok:
-        await callback.message.edit_text(
-            f"✅ <b>Заказ #{order_id} оплачен!</b>\n\nДанные отправлены вам в чат.",
-            reply_markup=back_main_kb(),
-        )
         await callback.answer("Оплата подтверждена!")
+        await callback.message.answer(
+            f"✅ <b>Заказ #{order_id} оплачен!</b>\n\nДанные отправлены вам в чат.",
+            reply_markup=main_reply_kb(),
+        )
     else:
         await callback.answer("Ошибка выдачи. Обратитесь в поддержку.", show_alert=True)
 
@@ -454,13 +486,13 @@ async def cb_check_payment_crypto(callback: CallbackQuery, db: Database) -> None
         return
 
     await notify_admins_payment_check(callback.bot, ADMIN_IDS, db, order_id)
-    await callback.message.edit_text(
+    await callback.answer("Отправлено на проверку")
+    await callback.message.answer(
         f"🔍 <b>Заказ #{order_id}</b>\n\n"
         f"Заявка отправлена администратору.\n"
         f"Ожидайте подтверждения — данные придут автоматически.",
-        reply_markup=back_main_kb(),
+        reply_markup=main_reply_kb(),
     )
-    await callback.answer("Отправлено на проверку")
 
 
 async def _create_order_from_cart(

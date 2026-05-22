@@ -8,13 +8,13 @@ from keyboards.inline import (
     catalog_kb,
     category_detail_kb,
     crypto_assets_kb,
-    main_menu_kb,
     payment_methods_kb,
     payment_order_kb,
 )
+from keyboards.reply import main_reply_kb
 
 __all__ = [
-    "main_menu_kb",
+    "main_reply_kb",
     "catalog_kb",
     "category_detail_kb",
     "cart_kb",
