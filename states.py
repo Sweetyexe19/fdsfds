@@ -23,3 +23,7 @@ class AdminSettings(StatesGroup):
 
 class AdminManualSell(StatesGroup):
     waiting_product_id = State()
+
+
+class AdminSeed(StatesGroup):
+    waiting_seed = State()

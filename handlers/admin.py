@@ -1,7 +1,7 @@
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from config import ADMIN_IDS
 from database import Database
@@ -16,7 +16,9 @@ from keyboards.inline import (
     back_main_kb,
 )
 from services.delivery import deliver_order
-from states import AdminCategory, AdminManualSell, AdminProducts, AdminSettings
+from services.encryption import DataEncryptor
+from services.sold_archive import archive_exists, clear_archive, get_archive_path
+from states import AdminCategory, AdminManualSell, AdminProducts, AdminSeed, AdminSettings
 
 router = Router()
 
@@ -342,6 +344,76 @@ async def cb_edit_crypto_wallet(callback: CallbackQuery, state: FSMContext, db: 
         f"Текущий: <code>{current or 'не задан'}</code>"
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "adm:download_sold")
+async def cb_download_sold(callback: CallbackQuery, db: Database) -> None:
+    if not await db.is_admin(callback.from_user.id):
+        return
+    if not archive_exists():
+        await callback.answer("Архив проданных пуст", show_alert=True)
+        return
+    path = get_archive_path()
+    await callback.message.answer_document(
+        FSInputFile(path, filename="sold_channels.txt"),
+        caption="📥 Архив проданных каналов",
+    )
+    clear_archive()
+    await callback.message.answer(
+        "✅ Архив выгружен и очищен.\nНовые продажи будут записываться с нуля.",
+        reply_markup=admin_main_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:seed")
+async def cb_seed_menu(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    encryptor: DataEncryptor,
+) -> None:
+    if not await db.is_admin(callback.from_user.id):
+        return
+    status = "✅ Включено" if encryptor.enabled else "❌ Не задано"
+    await callback.message.edit_text(
+        f"🔐 <b>Шифрование: {status}</b>\n\n"
+        f"Отправьте seed-фразу следующим сообщением (мин. 8 символов).\n"
+        f"Она шифрует данные каналов в БД.\n\n"
+        f"⚠️ При смене seed все товары перешифруются.\n"
+        f"Сохраните фразу — без неё данные не восстановить!",
+        reply_markup=admin_main_kb(),
+    )
+    await state.set_state(AdminSeed.waiting_seed)
+    await callback.answer()
+
+
+@router.message(AdminSeed.waiting_seed)
+async def admin_set_seed(
+    message: Message, state: FSMContext, db: Database, encryptor: DataEncryptor
+) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    seed = message.text.strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        count = await encryptor.setup_seed(db, seed)
+        db.encryptor = encryptor
+        await state.clear()
+        await message.answer(
+            f"✅ Seed-фраза установлена.\n"
+            f"Перешифровано товаров: {count}\n\n"
+            f"Все новые загрузки также будут шифроваться.",
+            reply_markup=admin_main_kb(),
+        )
+    except ValueError as e:
+        await message.answer(str(e))
+    except Exception:
+        await message.answer("❌ Ошибка установки seed-фразы", reply_markup=admin_main_kb())
+        await state.clear()
 
 
 @router.callback_query(F.data.startswith("adm:confirm:"))

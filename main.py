@@ -11,6 +11,7 @@ from database import Database
 from handlers import setup_routers
 from middlewares import DependenciesMiddleware
 from payment_checker import payment_checker_loop
+from services.encryption import DataEncryptor
 from services.yookassa_pay import YooKassaPayment
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -25,6 +26,10 @@ async def main() -> None:
     db = Database()
     await db.connect()
 
+    encryptor = DataEncryptor(BOT_TOKEN)
+    await encryptor.load_from_db(db)
+    db.encryptor = encryptor
+
     yookassa = YooKassaPayment(
         __import__("config").YOOKASSA_SHOP_ID,
         __import__("config").YOOKASSA_SECRET_KEY,
@@ -35,8 +40,8 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
-    dp.message.middleware(DependenciesMiddleware(db, yookassa))
-    dp.callback_query.middleware(DependenciesMiddleware(db, yookassa))
+    dp.message.middleware(DependenciesMiddleware(db, yookassa, encryptor))
+    dp.callback_query.middleware(DependenciesMiddleware(db, yookassa, encryptor))
     dp.include_router(setup_routers())
 
     checker_task = asyncio.create_task(payment_checker_loop(bot, db, yookassa))

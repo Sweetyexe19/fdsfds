@@ -12,6 +12,17 @@ class Database:
     def __init__(self, path: Path = DATABASE_PATH):
         self.path = path
         self._lock = asyncio.Lock()
+        self.encryptor = None
+
+    def _enc_fields(self, data: dict) -> dict:
+        if self.encryptor and self.encryptor.enabled:
+            return self.encryptor.encrypt_product(data)
+        return data
+
+    def _dec_row(self, row: dict) -> dict:
+        if self.encryptor and self.encryptor.enabled:
+            return self.encryptor.decrypt_product(row)
+        return row
 
     async def connect(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,6 +266,7 @@ class Database:
                 parsed = self.parse_product_line(line)
                 if not parsed:
                     continue
+                enc = self._enc_fields(parsed)
                 await db.execute(
                     """INSERT INTO products
                     (category_id, login, password, backup_email, backup_password,
@@ -262,12 +274,12 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'available')""",
                     (
                         category_id,
-                        parsed["login"],
-                        parsed["password"],
-                        parsed["backup_email"],
-                        parsed["backup_password"],
-                        parsed["twofa_key"],
-                        parsed["channel_link"],
+                        enc["login"],
+                        enc["password"],
+                        enc["backup_email"],
+                        enc["backup_password"],
+                        enc["twofa_key"],
+                        enc["channel_link"],
                     ),
                 )
                 added += 1
@@ -281,7 +293,30 @@ class Database:
                 "SELECT * FROM products WHERE id = ?", (product_id,)
             ) as cur:
                 row = await cur.fetchone()
-                return dict(row) if row else None
+                return self._dec_row(dict(row)) if row else None
+
+    async def get_all_products_raw(self) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM products") as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def update_product_fields(self, product_id: int, fields: dict) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """UPDATE products SET login=?, password=?, backup_email=?,
+                backup_password=?, twofa_key=?, channel_link=? WHERE id=?""",
+                (
+                    fields["login"],
+                    fields["password"],
+                    fields["backup_email"],
+                    fields["backup_password"],
+                    fields["twofa_key"],
+                    fields["channel_link"],
+                    product_id,
+                ),
+            )
+            await db.commit()
 
     async def mark_product_sold_manual(self, product_id: int) -> bool:
         async with self._lock:
@@ -294,6 +329,7 @@ class Database:
                     product = await cur.fetchone()
                     if not product:
                         return False
+                    product_dict = self._dec_row(dict(product))
                 sold_at = datetime.utcnow().isoformat()
                 await db.execute(
                     "UPDATE products SET status = 'sold', sold_at = ?, order_id = NULL "
@@ -303,7 +339,7 @@ class Database:
                 await db.commit()
                 if db.total_changes == 0:
                     return False
-        await self._export_sold_product(dict(product), order_id=None)
+        await self._export_sold_product(product_dict, order_id=None)
         return True
 
     async def list_products(
@@ -317,7 +353,7 @@ class Database:
                 (category_id, status, limit),
             ) as cur:
                 rows = await cur.fetchall()
-                return [dict(r) for r in rows]
+                return [self._dec_row(dict(r)) for r in rows]
 
     # --- Cart ---
 
@@ -608,7 +644,9 @@ class Database:
                         "SELECT * FROM products WHERE order_id = ? AND status = 'reserved'",
                         (order_id,),
                     ) as cur:
-                        products = [dict(r) for r in await cur.fetchall()]
+                        products = [
+                            self._dec_row(dict(r)) for r in await cur.fetchall()
+                        ]
 
                     if not products:
                         await db.execute("ROLLBACK")
@@ -639,14 +677,17 @@ class Database:
         return products
 
     async def _export_sold_product(self, product: dict, order_id: int | None) -> None:
-        line = (
-            f"{product['login']}:{product['password']}:{product['backup_email']}:"
-            f"{product['backup_password']}:{product['twofa_key']}:{product['channel_link']}"
+        from services.sold_archive import append_sold_line
+
+        append_sold_line(
+            product["login"],
+            product["password"],
+            product["backup_email"],
+            product["backup_password"],
+            product["twofa_key"],
+            product["channel_link"],
+            order_id=order_id,
         )
-        date_str = datetime.utcnow().strftime("%Y-%m-%d")
-        filepath = SOLD_EXPORT_DIR / f"sold_{date_str}.txt"
-        with open(filepath, "a", encoding="utf-8") as f:
-            f.write(f"[order:{order_id}] {line}\n")
 
     @staticmethod
     def format_product_delivery(product: dict, index: int) -> str:

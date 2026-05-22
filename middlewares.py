@@ -4,13 +4,17 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 
 from database import Database
+from services.encryption import DataEncryptor
 from services.yookassa_pay import YooKassaPayment
 
 
 class DependenciesMiddleware(BaseMiddleware):
-    def __init__(self, db: Database, yookassa: YooKassaPayment):
+    def __init__(
+        self, db: Database, yookassa: YooKassaPayment, encryptor: DataEncryptor
+    ):
         self.db = db
         self.yookassa = yookassa
+        self.encryptor = encryptor
 
     async def __call__(
         self,
@@ -20,4 +24,5 @@ class DependenciesMiddleware(BaseMiddleware):
     ) -> Any:
         data["db"] = self.db
         data["yookassa"] = self.yookassa
+        data["encryptor"] = self.encryptor
         return await handler(event, data)

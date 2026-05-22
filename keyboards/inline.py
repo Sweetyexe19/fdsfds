@@ -169,6 +169,8 @@ def admin_main_kb() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="📁 Категории", callback_data="adm:categories"))
     builder.row(InlineKeyboardButton(text="📦 Загрузить товары", callback_data="adm:upload"))
     builder.row(InlineKeyboardButton(text="🪙 Крипто-кошельки", callback_data="adm:crypto_wallets"))
+    builder.row(InlineKeyboardButton(text="📥 Скачать проданные", callback_data="adm:download_sold"))
+    builder.row(InlineKeyboardButton(text="🔐 Seed-фраза", callback_data="adm:seed"))
     builder.row(InlineKeyboardButton(text="🏷 Пометить проданным", callback_data="adm:sell"))
     builder.row(InlineKeyboardButton(text="📋 Заказы", callback_data="adm:orders"))
     builder.row(InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:settings"))
